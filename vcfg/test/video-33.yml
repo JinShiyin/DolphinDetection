@@ -1,13 +1,13 @@
-index: 20
+index: 33
 name: video6_hungred_million
 camera_id: camera_bp_1
-channel: 1
+channel: 2
 shape:
   - 1080
   - 1920
   - 3
 ip: 222.190.243.176
-dip: http://10.196.122.96:8081
+dip: http://221.226.81.54:1211
 port: '8081'
 suffix: ''
 headers: {}
@@ -15,7 +15,7 @@ m3u8_url: ''
 url: ''
 roi:
   x: 0
-  y: 60
+  y: 0
   width: -1
   height: -1
 resize:
@@ -35,14 +35,14 @@ draw_boundary: false
 enable: false
 filtered_ratio: 0.5
 max_streams_cache: 5000
-online: vlc_rtsp
+online: vlc_offline
 cap_loop: false
 sample_internal: 15
-save_box: true
-show_box: true
+save_box: false
+show_box: false
 cv_only: true
 ssd_divide_four: false
-rtsp: rtsp://10.196.122.98/cvcam/25/stream1
+rtsp: rtsp://10.196.122.98/cvcam/21/stream1
 push_to: rtsp://192.168.0.116/yz
 write_timestamp: false
 enable_sample_frame: false
@@ -57,23 +57,23 @@ pre_cache: 48
 render: true
 post_filter: false
 forward_filter: false
-limit_freq: true
+limit_freq: false
 freq_thresh: 60
 bbox:
-  w: 224
-  h: 224
+  w: 128
+  h: 128
 alg:
   type: thresh
   sp: 10
   sr: 60
   dk_size: -1
-  ok_size: 3
+  ok_size: 1
   mean: 40
-  block_size: 101
+  block_size: 21
   filtered_by_wh: false
-  rwt: 120
-  rht: 25
-  area: 400
+  rwt: 0
+  rht: 0
+  area: 10
   area_ratio: 0.03
   color_range:
     - 80
@@ -85,4 +85,6 @@ alg:
   continuous_time_thresh: 36
   disappear_frames_thresh: 3
   track_confidence: 0.95
-  ssd_confidence: 0.86
+  ssd_confidence: 0.50
+  cascade_model_path: mmdetection/work_dirs/cascade_rcnn_r50_caffe_fpn_1x_coco_Yuzhui/latest.pth
+  cascade_model_cfg:  mmdetection/configs/cascade_rcnn/cascade_rcnn_r50_caffe_fpn_1x_coco.py

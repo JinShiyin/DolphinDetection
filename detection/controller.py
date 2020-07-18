@@ -12,24 +12,24 @@
 """
 
 import os.path as osp
-from typing import List
+import time
+import traceback
 from multiprocessing import Pool
 
+import imutils
+import numpy as np
+
 from classfy.model import DolphinClassifier
-from . import Detector
-from .params import DispatchBlock, ConstructResult, BlockInfo, ConstructParams, DetectorParams
-from .render import ArrivalMsgType, ArrivalMessage
+from config import ModelType
+from .render import ArrivalMessage, ArrivalMsgType
 from stream.websocket import *
 from utils.cache import SharedMemoryFrameCache
-# from utils import NoDaemonPool as Pool
-from .ssd import SSDDetector
+from . import Detector
 from .capture import *
 from .detect_funcs import *
-from config import ModelType
-import time
-import imutils
-import traceback
-import numpy as np
+from .params import DispatchBlock
+# from utils import NoDaemonPool as Pool
+from .ssd import SSDDetector
 
 
 # from pynput.keyboard import Key, Controller, Listener
@@ -60,6 +60,7 @@ class DetectorController(object):
         self.rect_stream_path = self.candidate_path / 'render-streams'
         self.original_stream_path = self.candidate_path / 'original-streams'
         self.test_path = self.candidate_path / 'tests'
+        self.preview_path = self.candidate_path / 'preview'
         self.create_workspace()
 
         self.result_cnt = 0
@@ -74,7 +75,9 @@ class DetectorController(object):
         self.result_queue = Manager().Queue(self.cfg.max_streams_cache)
         self.quit = Manager().Event()
         self.quit.clear()
+
         self.status = Manager().Value('i', SystemStatus.SHUT_DOWN)
+        self.global_index = Manager().Value('i', 0)
 
         self.next_prepare_event = Manager().Event()
         self.next_prepare_event.clear()
@@ -87,8 +90,9 @@ class DetectorController(object):
         self.original_frame_cache = frame_cache
 
         # bbox cache, retrieval by frame index,none represent this frame don't exist bbox
-        self.render_rect_cache = Manager().list()
-        self.render_rect_cache[:] = [None] * self.cache_size
+        # self.render_rect_cache = Manager().list()
+        self.render_rect_cache = Manager().dict()
+        # self.render_rect_cache[:] = [None] * self.cache_size
         self.LOG_PREFIX = f'Controller [{self.cfg.index}]: '
         self.save_cache = {}
 
@@ -124,6 +128,7 @@ class DetectorController(object):
         self.original_stream_path.mkdir(exist_ok=True, parents=True)
         self.block_path.mkdir(exist_ok=True, parents=True)
         self.test_path.mkdir(exist_ok=True, parents=True)
+        self.preview_path.mkdir(exist_ok=True, parents=True)
 
     def start(self, pool):
         self.status.set(SystemStatus.RUNNING)
@@ -211,7 +216,7 @@ class DetectorController(object):
                 save_file[key] = self.save_cache[key]
 
             fw = open(bbox_path, 'w')
-            fw.write(json.dumps(self.save_cache, indent=4))
+            fw.write(json.dumps(save_file, indent=4))
             fw.close()
 
             self.save_cache = {}
@@ -235,7 +240,7 @@ class TaskBasedDetectorController(DetectorController):
 
     def __init__(self, server_cfg: ServerConfig, cfg: VideoConfig, stream_path: Path, candidate_path: Path,
                  frame_path: Path, frame_queue: Queue, index_pool: Queue, msg_queue: Queue, streaming_queue: List,
-                 render_notify_queue, frame_cache: SharedMemoryFrameCache) -> None:
+                 render_notify_queue, frame_cache: SharedMemoryFrameCache,recoder) -> None:
         super().__init__(cfg, stream_path, candidate_path, frame_path, frame_queue, index_pool, msg_queue, frame_cache)
         # self.construct_params = ray.put(
         #     ConstructParams(self.result_queue, self.original_frame_cache, self.render_frame_cache,
@@ -253,8 +258,8 @@ class TaskBasedDetectorController(DetectorController):
         self.frame_stack = Manager().list()
         self.detect_handler = None
         # self.stream_render = stream_render
-        self.global_index = Manager().Value('i', 0)
         self.render_notify_queue = render_notify_queue
+        self.recorder = recoder
         self.init_control_range()
         self.init_detectors()
 
@@ -369,7 +374,7 @@ class TaskBasedDetectorController(DetectorController):
                 if len(r.rects):
                     self.result_queue.put((r.frame_index, r.rects))
                     rects = []
-                    if len(r.rects) >= 3:
+                    if len(r.rects) >= 5:
                         logger.info(f'To many rect candidates: [{len(r.rects)}].Abandoned..... ')
                         return ConstructResult(original_frame, None, None, frame_index=current_index)
                     for rect in r.rects:
@@ -382,7 +387,7 @@ class TaskBasedDetectorController(DetectorController):
                             logger.debug(
                                 self.LOG_PREFIX + f'Model Operation Speed Rate: [{round(1 / (time.time() - start), 2)}]/FPS')
                         if detect_result:
-                            logger.info(
+                            logger.debug(
                                 f'============================Controller [{self.cfg.index}]: Dolphin Detected============================')
                             self.dol_gone = False
                             push_flag = True
@@ -391,11 +396,11 @@ class TaskBasedDetectorController(DetectorController):
                     if push_flag:
                         json_msg = creat_detect_msg_json(video_stream=self.cfg.rtsp, channel=self.cfg.channel,
                                                          timestamp=current_index, rects=r.rects, dol_id=self.dol_id,
-                                                         camera_id=self.cfg.camera_id)
-                        logger.info(f'put detect message in msg_queue...')
+                                                         camera_id=self.cfg.camera_id, cfg=self.cfg)
                         self.msg_queue.put(json_msg)
                         if self.cfg.render:
-                            self.render_rect_cache[current_index % self.cache_size] = r.rects
+                            # self.render_rect_cache[current_index % self.cache_size] = r.rects
+                            self.render_rect_cache[current_index] = r.rects
                         self.forward_filter(current_index, rects)
                         self.notify_render(current_index)
                     else:
@@ -423,15 +428,21 @@ class TaskBasedDetectorController(DetectorController):
         which can reach 60FPS+ speed when processing 4K video frames
         :return:
         """
+        import os
+        os.environ["CUDA_VISIBLE_DEVICES"] = f'{int(self.cfg.index) % 4}'
+
+        from mmdetection import init_detector
+        import torch
+        torch.set_num_threads(1)
         classifier = None
-        ssd_detector = None
+        model = None
 
         # init different detection models according configuration inside the SUB-PROCESS
         # every frame looper will occupy single model instance by now
         # TODO less model instances,but could be shared by all detectors
         if self.server_cfg.detect_mode == ModelType.SSD:
-            ssd_detector = SSDDetector(model_path=self.server_cfg.detect_model_path, device_id=self.server_cfg.cd_id)
-            ssd_detector.run()
+            model = SSDDetector(model_path=self.server_cfg.detect_model_path, device_id='0')
+            model.run()
             logger.info(
                 f'*******************************Capture [{self.cfg.index}]: Running SSD Model********************************')
         elif self.server_cfg.detect_mode == ModelType.CLASSIFY and not self.cfg.cv_only:
@@ -440,6 +451,17 @@ class TaskBasedDetectorController(DetectorController):
             classifier.run()
             logger.info(
                 f'*******************************Capture [{self.cfg.index}]: Running Classifier Model********************************')
+        elif self.server_cfg.detect_mode == ModelType.CASCADE:
+            os.environ["CUDA_VISIBLE_DEVICES"] = f'{int(self.cfg.index) % 4}'
+            cascade_model_cfg = self.server_cfg.cascade_model_cfg
+            cascade_model_path = self.server_cfg.cascade_model_path
+            if self.cfg.alg['cascade_model_cfg'] != '':
+                cascade_model_cfg = self.cfg.alg['cascade_model_cfg']
+                cascade_model_path = self.cfg.alg['cascade_model_path']
+            model = init_detector(cascade_model_cfg, cascade_model_path)
+            logger.info(
+                f'*******************************Capture [{self.cfg.index}]: Running Cascade-RCNN Model********************************')
+
         logger.info(
             '*******************************Controller [{}]: Init Loop Stack********************************'.format(
                 self.cfg.index))
@@ -457,7 +479,7 @@ class TaskBasedDetectorController(DetectorController):
                 # logger.info(f'Current index: {current_index}')
                 frame = self.original_frame_cache[current_index]
                 s = time.time()
-                self.dispatch(frame, None, ssd_detector, classifier, current_index)
+                self.dispatch(frame, None, model, classifier, current_index)
                 e = 1 / (time.time() - s)
                 logger.debug(self.LOG_PREFIX + f'Detection Process Speed: [{round(e, 2)}]/FPS')
             except Exception as e:
@@ -494,11 +516,13 @@ class TaskBasedDetectorController(DetectorController):
         # select different detection methods according the configuration
         if self.server_cfg.detect_mode == ModelType.CLASSIFY:  # using classifier
             self.classify_based(args, original_frame.copy())
-        elif self.server_cfg.detect_mode == ModelType.SSD:  # using SSD
-            self.ssd_based(args, original_frame.copy())
+        # using SSD or Cascade-RCNN
+        elif self.server_cfg.detect_mode == ModelType.SSD or self.server_cfg.detect_mode == ModelType.CASCADE:
+            self.model_based(args, original_frame.copy())
         elif self.server_cfg.detect_mode == ModelType.FORWARD:  # done nothing
             self.forward(args, original_frame)
-        # self.clear_original_cache()
+
+    # self.clear_original_cache()
 
     def forward(self, args, original_frame):
         """
@@ -511,22 +535,43 @@ class TaskBasedDetectorController(DetectorController):
 
         # self.push_stream_queue.append((original_frame, None, self.pre_cnt))
 
-    def ssd_based(self, args, original_frame):
-        ssd_model = args[2]
+    def model_based(self, args, original_frame):
+        model_instance = args[2]
         if self.pre_cnt % self.cfg.sample_rate == 0:
             start = time.time()
-            frames_results = self.get_ssd_result(original_frame, ssd_model)
+            frames_results = self.get_model_result(original_frame, model_instance, self.server_cfg)
             logger.debug(
-                self.LOG_PREFIX + f'Model Operation Speed Rate: [{round(1 / (time.time() - start), 2)}]/FPS')
+                self.LOG_PREFIX + f'Model [{self.cfg.index}]: Operation Speed Rate: [{round(1 / (time.time() - start), 2)}]/FPS')
             # render_frame = original_frame.copy()
             detect_results = []
             detect_flag = False
             current_index = self.pre_cnt
             rects = []
+            if self.cfg.show_window:
+                cv2.namedWindow(str(self.cfg.index), cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
+                frame = original_frame
+                if len(frames_results):
+                    for rect in frames_results[0]:
+                        if rect[4] > self.cfg.alg['ssd_confidence']:
+                            cv2.imwrite(f'data/frames/{self.cfg.index}_{current_index}.png',
+                                        cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB))
+                            color = np.random.randint(0, 255, size=(3,))
+                            color = [int(c) for c in color]
+                            # get a square bbox, the real bbox of width and height is universal as 224 * 224 or 448 * 448
+                            p1, p2 = bbox_points(self.cfg, rect, original_frame.shape)
+                            # write text
+                            frame = paint_chinese_opencv(frame, '江豚', p1)
+                            cv2.rectangle(frame, (rect[0], rect[1]), (rect[2], rect[3]), color, 2)
+                            cv2.putText(frame, str(round(rect[4], 2)), (p2[0], p2[1]),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 2, color, 2, cv2.LINE_AA)
+                cv2.imshow(str(self.cfg.index), frame)
+                cv2.waitKey(1)
+
             if len(frames_results):
                 for frame_result in frames_results:
                     if len(frame_result):
-                        rects = [r for r in frame_result if r[4] > self.cfg.alg['ssd_confidence']]
+                        rects = [r for r in frame_result if
+                                 r[4] > self.cfg.alg['ssd_confidence']]
                         if len(rects):
                             self.result_queue.put((current_index, rects))
                             if len(rects) >= 3:
@@ -536,27 +581,28 @@ class TaskBasedDetectorController(DetectorController):
                             detect_flag = True
                             self.dol_gone = False
                             logger.info(
-                                f'============================Controller [{self.cfg.index}]: Dolphin Detected============================')
+                                f'============================Controller [{self.cfg.index}]: Dolphin Detected in frame [{current_index}]============================')
                     if detect_flag:
-                        json_msg = creat_detect_msg_json(video_stream=self.cfg.rtsp, channel=self.cfg.channel,
-                                                         timestamp=current_index, rects=rects, dol_id=self.dol_id,
-                                                         camera_id=self.cfg.camera_id)
-                        self.msg_queue.put(json_msg)
-                        logger.debug(f'put detect message in msg_queue {json_msg}...')
+                        # json_msg = creat_detect_msg_json(video_stream=self.cfg.rtsp, channel=self.cfg.channel,
+                        #                                 timestamp=current_index, rects=rects, dol_id=self.dol_id,
+                        #                                 camera_id=self.cfg.camera_id)
+                        # self.msg_queue.put(json_msg)
+                        # logger.debug(f'put detect message in msg_queue {json_msg}...')
                         # self.render_frame_cache[current_index % self.cache_size] = render_frame
-                        if self.cfg.render:
-                            self.render_rect_cache[current_index % self.cache_size] = rects
+                        #if self.cfg.render:
+                        #    self.render_rect_cache[current_index % self.cache_size] = rects
                         self.forward_filter(current_index, rects)
                         self.notify_render(current_index)
-                    else:
-                        if not self.dol_gone:
-                            empty_msg = creat_detect_empty_msg_json(video_stream=self.cfg.rtsp,
-                                                                    channel=self.cfg.channel,
-                                                                    timestamp=current_index, dol_id=self.dol_id,
-                                                                    camera_id=self.cfg.camera_id)
-                            self.dol_id += 1
-                            self.msg_queue.put(empty_msg)
-                            self.dol_gone = True
+                        self.recorder.record()
+                    # else:
+                    #    if not self.dol_gone:
+                    # empty_msg = creat_detect_empty_msg_json(video_stream=self.cfg.rtsp,
+                    #                                        channel=self.cfg.channel,
+                    #                                        timestamp=current_index, dol_id=self.dol_id,
+                    #                                        camera_id=self.cfg.camera_id)
+                    # self.dol_id += 1
+                    # self.msg_queue.put(empty_msg)
+                    #        self.dol_gone = True
             self.update_render(current_index)
             self.update_detect_handler(current_index)
             # threading.Thread(target=self.str.notify, args=(current_index,), daemon=True).start()
@@ -609,11 +655,11 @@ class TaskBasedDetectorController(DetectorController):
             self.detect_handler.notify(ArrivalMessage(current_index, ArrivalMsgType.DETECTION, rects=rects))
         # TODO control instant detection signal commit
 
-    def get_ssd_result(self, original_frame, ssd_model):
+    def get_model_result(self, original_frame, model, server_cfg: ServerConfig, inference_detector=None):
         """
         get detection result from ssd model
         :param original_frame: numpy frame
-        :param ssd_model: model instance
+        :param model: model instance
         :return:
         """
         if self.cfg.ssd_divide_four:
@@ -622,7 +668,8 @@ class TaskBasedDetectorController(DetectorController):
             """
             # TODO bug to be fixed
             b1, b2, b3, b4 = split_img_to_four(original_frame)
-            block_res = ssd_model([b1, b2, b3, b4])
+            if server_cfg.detect_mode == 'ssd':
+                block_res = model([b1, b2, b3, b4])
             if len(block_res):
                 decode(original_frame, block_res, 0)
                 decode(original_frame, block_res, 1)
@@ -630,7 +677,16 @@ class TaskBasedDetectorController(DetectorController):
                 decode(original_frame, block_res, 3)
             return block_res
         else:
-            return ssd_model([original_frame])
+            if server_cfg.detect_mode == 'ssd':
+
+                return model([original_frame])
+            elif server_cfg.detect_mode == 'cascade':
+                from mmdetection import inference_detector
+                result_cascade = inference_detector(model, original_frame)
+                if len(result_cascade[0]):
+                    return result_cascade
+                else:
+                    return []
 
     def post_stream_req(self, construct_result, original_frame):
         """
@@ -657,6 +713,10 @@ class TaskBasedDetectorController(DetectorController):
             # logger.debug('Controller [{}]: Dispatch frame to all detectors....'.format(self.cfg.index))
             async_futures = []
             frame, original_frame = preprocess(original_frame, self.cfg)
+            if self.cfg.show_window:
+                cv2.namedWindow(str(self.cfg.index), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                cv2.imshow(str(self.cfg.index), frame)
+                cv2.waitKey(0)
             s = time.time()
             for d in self.detect_params:
                 block = DispatchBlock(crop_by_se(frame, d.start, d.end),

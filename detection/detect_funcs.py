@@ -138,17 +138,22 @@ def adaptive_thresh_with_rules(frame, block, params: DetectorParams):
     # construct kernel element
     dk_size = params.cfg.alg['dk_size']
     ok_size = params.cfg.alg['ok_size']
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ok_size, ok_size))
 
-    # smooth frame regions whose color is similar
     frame = cv2.pyrMeanShiftFiltering(frame, params.cfg.alg['sp'], params.cfg.alg['sr'])
 
+    cv2.namedWindow(str(params.cfg.index) + '-' + 'Smooth', cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.imshow(str(params.cfg.index) + '-' + 'Smooth', frame)
+    cv2.waitKey(1)
     # adaptive thresh by size
     thresh_binary = adaptive_thresh_size(frame, block_size=params.cfg.alg['block_size'],
                                          C=params.cfg.alg['mean'])
     # TODO using multiple scales thresh to filter small object or noises
     # remove small objects
-    binary = cv2.morphologyEx(thresh_binary, cv2.MORPH_OPEN, open_kernel)
+    if ok_size != -1:
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ok_size, ok_size))
+        binary = cv2.morphologyEx(thresh_binary, cv2.MORPH_OPEN, open_kernel)
+    else:
+        binary = thresh_binary
 
     # enlarge candidates a little
     if dk_size != -1:
@@ -167,6 +172,13 @@ def adaptive_thresh_with_rules(frame, block, params: DetectorParams):
     num_components, label_map, rects, centroids = cv2.connectedComponentsWithStats(binary)
 
     binary_map = np.zeros(binary.shape, dtype=np.uint8)
+    global_binary_map = np.zeros(binary.shape, dtype=np.uint8)
+    for i in range(1, num_components):
+        global_binary_map[label_map == i] = 255
+    if params.cfg.show_window:
+        cv2.namedWindow(str(params.cfg.index) + '-' + 'Global Binary', cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        cv2.imshow(str(params.cfg.index) + '-' + 'Global Binary', global_binary_map)
+        cv2.waitKey(1)
     filtered_rects = []
     block_bgr_means = []  # candidate block color mean
     # 0 index is background,skipped it
@@ -175,14 +187,14 @@ def adaptive_thresh_with_rules(frame, block, params: DetectorParams):
         # block color range is black enough
         if rects[i][cv2.CC_STAT_AREA] > params.cfg.alg['area'] and is_block_black(frame, i, label_map, color_range):
             # if rects[i][cv2.CC_STAT_AREA] > params.cfg.alg['area']:
+            # if rects[i][cv2.CC_STAT_AREA] > params.cfg.alg['area']:
             # draw white pixels if current is a components
-            logger.info(f'Area: {rects[i][cv2.CC_STAT_AREA]}')
-            logger.info(f'Height: {rects[i][cv2.CC_STAT_HEIGHT]}')
-            logger.info(f'Width: {rects[i][cv2.CC_STAT_WIDTH]}')
+            # logger.info(f'Area: {rects[i][cv2.CC_STAT_AREA]}')
+            # logger.info(f'Height: {rects[i][cv2.CC_STAT_HEIGHT]}')
+            # logger.info(f'Width: {rects[i][cv2.CC_STAT_WIDTH]}')
             binary_map[label_map == i] = 255
             # merge all white blocks into a single binary map
             filtered_rects.append(rects[i])
-
     # rect coordinates in original frame
     original_rects = back(filtered_rects, params.start, frame.shape, block.shape, params.cfg)
 
